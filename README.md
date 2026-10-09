@@ -31,6 +31,23 @@ python deal_radar.py --once --json > hits.json
 | `--watch` | — | poll continuously until Ctrl+C |
 | `--interval` | 300 | seconds between passes in watch mode |
 | `--json` | — | emit hits as JSON |
+| `--claude` | — | Claude writes a human analyst-style digest of the hits (needs `ANTHROPIC_API_KEY`) |
+| `--claude-model` | claude-sonnet-5-5 | Claude model used for `--claude` |
+
+## Claude digest (optional)
+
+Raw keyword hits are noisy. With an Anthropic API key, Deal Radar hands the
+hits to Claude and gets back a morning-brief digest — grouped by theme, with
+the genuinely free and high-value finds flagged:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+python deal_radar.py --once --claude --keywords free,giveaway,"promo code"
+```
+
+Still stdlib only — it calls the Anthropic Messages API directly, no SDK.
+If the Claude call fails, you still get the raw hits; the digest is a bonus,
+never a dependency.
 
 ## Requirements
 

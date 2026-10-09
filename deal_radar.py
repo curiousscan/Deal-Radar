@@ -12,18 +12,21 @@ Usage:
     python deal_radar.py --once --keywords free,giveaway,"promo code"
     python deal_radar.py --watch --interval 300 --subreddits deals,buildapcsales
     python deal_radar.py --once --json > hits.json
+    python deal_radar.py --once --claude   # Claude-written digest (needs ANTHROPIC_API_KEY)
 """
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 USER_AGENT = f"curiousscan-deal-radar/{VERSION} (open-source keyword watcher)"
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
 
@@ -36,6 +39,79 @@ DEFAULT_SUBREDDITS = [
 ]
 
 DEFAULT_KEYWORDS = ["free", "giveaway", "promo code", "coupon", "100% off"]
+
+# Claude integration (optional). Uses the Anthropic Messages API directly —
+# stdlib only, no SDK needed. Verify current model IDs at
+# https://docs.anthropic.com/en/docs/about-claude/models/overview
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
+
+
+def get_anthropic_key():
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        print(
+            "ERROR: --claude needs ANTHROPIC_API_KEY.\n"
+            "Get one at https://console.anthropic.com/ then run:\n"
+            '  export ANTHROPIC_API_KEY="sk-ant-..."',
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return key
+
+
+def claude_complete(api_key, model, system, user_text, max_tokens=1500):
+    """One Anthropic Messages API call. Returns text or raises RuntimeError."""
+    payload = json.dumps(
+        {
+            "model": model,
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": [{"role": "user", "content": user_text}],
+        }
+    ).encode()
+    req = urllib.request.Request(
+        ANTHROPIC_API_URL,
+        data=payload,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.load(resp)
+        return "".join(
+            b.get("text", "")
+            for b in data.get("content", [])
+            if b.get("type") == "text"
+        ).strip()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")[:300]
+        raise RuntimeError(f"Claude API -> HTTP {exc.code}: {body}")
+
+
+def claude_digest(hits, api_key, model):
+    """Turn raw hits into a human analyst-style digest via Claude."""
+    lines = [
+        f"- [r/{h['subreddit']}] {h['title']} ({h['url']}) "
+        f"[matched: {', '.join(h['matched_keywords'])}]"
+        for h in hits
+    ]
+    user_text = (
+        "Here are today's deal-feed hits. Write a short morning-brief digest: "
+        "group by theme, flag the genuinely free or high-value ones, skip the "
+        "junk. Keep it tight, no fluff.\n\n" + "\n".join(lines)
+    )
+    return claude_complete(
+        api_key,
+        model,
+        "You are a sharp deal analyst writing a morning brief for bargain "
+        "hunters. Terse, opinionated, honest about what is actually worth clicking.",
+        user_text,
+    )
 
 
 def fetch_new(subreddit):
@@ -122,6 +198,10 @@ def main():
     ap.add_argument("--interval", type=int, default=300,
                     help="Seconds between passes in --watch mode (default 300).")
     ap.add_argument("--json", action="store_true", help="Emit hits as JSON.")
+    ap.add_argument("--claude", action="store_true",
+                    help="Summarize hits into a Claude-written digest (needs ANTHROPIC_API_KEY).")
+    ap.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL,
+                    help=f"Claude model for --claude (default {DEFAULT_CLAUDE_MODEL}).")
     args = ap.parse_args()
 
     subreddits = [s.strip() for s in args.subreddits.split(",") if s.strip()]
@@ -129,9 +209,24 @@ def main():
     if not subreddits or not keywords:
         ap.error("need at least one subreddit and one keyword")
 
+    claude_key = get_anthropic_key() if args.claude else None
+
+    def report(hits):
+        if not hits:
+            print("No matches this pass.")
+            return
+        print_hits(hits, args.json)
+        if claude_key:
+            print("\n--- Claude digest ---\n")
+            try:
+                print(claude_digest(hits, claude_key, args.claude_model))
+            except RuntimeError as exc:
+                print(f"[!] Claude digest failed: {exc}", file=sys.stderr)
+                print("[!] Showing raw hits only.", file=sys.stderr)
+
     seen = set()
     if args.once or not args.watch:
-        print_hits(scan(subreddits, keywords, seen), args.json)
+        report(scan(subreddits, keywords, seen))
         return
 
     print(f"[*] Watching {len(subreddits)} subs every {args.interval}s — Ctrl+C to stop.")
@@ -140,7 +235,7 @@ def main():
             hits = scan(subreddits, keywords, seen)
             if hits:
                 print(f"\n=== {datetime.now(timezone.utc).isoformat()} — {len(hits)} hit(s) ===")
-                print_hits(hits, args.json)
+                report(hits)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\n[*] Stopped.")
